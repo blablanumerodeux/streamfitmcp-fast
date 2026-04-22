@@ -1,4 +1,5 @@
 import os
+import time
 from dataclasses import dataclass
 from dotenv import load_dotenv
 
@@ -11,11 +12,11 @@ class StreamFitConfig:
     email: str = os.getenv("STREAMFIT_EMAIL", "")
     pin: str = os.getenv("STREAMFIT_PIN", "")
 
-    # Internal auth state (set after login)
-    auth_token: str | None = None
-    client: str | None = None
-    expiry: str | None = None
-    uid: str | None = None
+    # Pre-set tokens from environment (e.g. extracted from browser session)
+    auth_token: str | None = os.getenv("STREAMFIT_ACCESS_TOKEN") or None
+    client: str | None = os.getenv("STREAMFIT_CLIENT") or None
+    expiry: str | None = os.getenv("STREAMFIT_EXPIRY") or None
+    uid: str | None = os.getenv("STREAMFIT_UID") or None
 
     def is_authenticated(self) -> bool:
         if not all([self.auth_token, self.client, self.expiry, self.uid]):
@@ -30,6 +31,3 @@ class StreamFitConfig:
         self.client = None
         self.expiry = None
         self.uid = None
-
-
-import time
