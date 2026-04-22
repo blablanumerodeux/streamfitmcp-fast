@@ -1,6 +1,5 @@
 import os
-import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -11,23 +10,16 @@ class StreamFitConfig:
     base_url: str = os.getenv("STREAMFIT_BASE_URL", "https://api.streamfit.com")
     email: str = os.getenv("STREAMFIT_EMAIL", "")
     pin: str = os.getenv("STREAMFIT_PIN", "")
+    channel_id: str = os.getenv("STREAMFIT_CHANNEL_ID", "812")
 
-    # Pre-set tokens from environment (e.g. extracted from browser session)
-    auth_token: str | None = os.getenv("STREAMFIT_ACCESS_TOKEN") or None
-    client: str | None = os.getenv("STREAMFIT_CLIENT") or None
-    expiry: str | None = os.getenv("STREAMFIT_EXPIRY") or None
-    uid: str | None = os.getenv("STREAMFIT_UID") or None
+    # Pre-existing auth tokens (from web session)
+    access_token: str = os.getenv("STREAMFIT_ACCESS_TOKEN", "")
+    client: str = os.getenv("STREAMFIT_CLIENT", "")
+    expiry: str = os.getenv("STREAMFIT_EXPIRY", "")
+    uid: str = os.getenv("STREAMFIT_UID", "")
 
-    def is_authenticated(self) -> bool:
-        if not all([self.auth_token, self.client, self.expiry, self.uid]):
-            return False
-        try:
-            return (int(self.expiry) * 1000) > int(time.time() * 1000)
-        except (ValueError, TypeError):
-            return False
+    # Internal state
+    is_authenticated: bool = False
 
-    def clear_auth(self):
-        self.auth_token = None
-        self.client = None
-        self.expiry = None
-        self.uid = None
+    def is_fully_authenticated(self) -> bool:
+        return bool(self.access_token and self.client and self.uid)
