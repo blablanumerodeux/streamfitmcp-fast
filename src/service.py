@@ -1,7 +1,7 @@
 import httpx
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from src.config import StreamFitConfig
@@ -13,15 +13,26 @@ class StreamFitService:
     """
     StreamFit API client for CrossFit 514.
 
-    Supports two auth methods:
-    1. Pre-existing tokens (access-token + client + uid) — from web session
-    2. Email + PIN — Devise token auth (mobile app API)
+    Auth (2026 — current API):
+      The old /api/v1/new/auth/sign_in PIN flow is DEAD ("Update your app").
+      The web app now uses: reCAPTCHA v3 -> federate -> verify_pin -> verify_mfa
+      (email code). Google scores programmatic captcha tokens too low, so
+      headless-token auth fails with 403 "Recaptcha verification failed".
 
-    Key endpoints discovered:
-      POST /api/v1/new/auth/sign_in         — PIN auth
-      GET  /api/v1/channels/{id}            — gym info
-      GET  /api/v1/channels/{id}/calendar_workouts — class schedule
-      GET  /api/v1/workouts/{id}            — workout details
+      Working strategy (implemented here):
+        1. Try saved Devise tokens (access-token/client/uid — long-lived).
+        2. If invalid, run the real login UI in headless Chromium
+           (src/browser_login.py) — passes reCAPTCHA because it IS a real
+           browser session. MFA code is read from Gmail via gws CLI.
+        3. Save tokens for fast reuse.
+
+    Key endpoints (verified working):
+      GET  /api/v1/auth/validate_token              — token check
+      GET  /api/v1/channels/{id}                    — gym info
+      GET  /api/v1/channels/{id}/calendar_workouts  — full class schedule
+      GET  /api/v1/users/calendar/workouts_by_day   — MY calendar (has
+                                                      `registered` flag)
+      GET  /api/v1/workouts/{id}                    — workout details
     """
 
     def __init__(self, config: StreamFitConfig):
@@ -31,16 +42,29 @@ class StreamFitService:
     # ── Auth ──────────────────────────────────────────────────────────────────
 
     def authenticate(self) -> dict[str, Any]:
-        """Authenticate via email+PIN or validate existing tokens."""
+        """Validate saved tokens; on failure, re-login via headless browser."""
+        # env tokens take priority; otherwise load from tokens file
+        self.config.load_tokens_from_file()
+
         if self.config.is_fully_authenticated():
-            # Validate tokens first
             validated = self._validate_tokens()
             if validated.get("status") == "valid":
                 self.config.is_authenticated = True
                 return {"status": "authenticated", "method": "token"}
 
-        # Fall back to email+PIN
-        return self._authenticate_pin()
+        from src.browser_login import BrowserLogin
+        login = BrowserLogin(
+            email=self.config.email,
+            pin=self.config.pin,
+            tokens_path=self.config.tokens_path,
+        )
+        result = login.login()
+        if result.get("status") == "authenticated":
+            # reload freshly saved tokens into config
+            self.config.access_token = ""
+            self.config.load_tokens_from_file()
+            self.config.is_authenticated = True
+        return result
 
     def _validate_tokens(self) -> dict[str, Any]:
         """Check if stored tokens are still valid."""
@@ -56,48 +80,6 @@ class StreamFitService:
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    def _authenticate_pin(self) -> dict[str, Any]:
-        """Authenticate with email + PIN via the mobile app API."""
-        if not self.config.email or not self.config.pin:
-            return {"status": "error", "message": "Missing STREAMFIT_EMAIL or STREAMFIT_PIN"}
-
-        url = f"{self.config.base_url}/api/v1/new/auth/sign_in"
-        payload = {
-            "input": "email",
-            "phone": None,
-            "email": self.config.email,
-            "is_new_user": False,
-            "pin": True,
-            "exists_email": True,
-            "code": self.config.pin,
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "origin": "https://go.streamfit.com",
-            "referer": "https://go.streamfit.com/",
-        }
-
-        try:
-            response = self._client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            return {"status": "error", "message": f"Auth failed ({e.response.status_code}): {e.response.text[:200]}"}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-
-        headers_map = dict(response.headers)
-        self.config.access_token = headers_map.get("access-token", "")
-        self.config.client = headers_map.get("client", "")
-        self.config.expiry = headers_map.get("expiry", "")
-        self.config.uid = headers_map.get("uid", "")
-
-        if not self.config.access_token:
-            return {"status": "error", "message": "No access-token in response headers"}
-
-        self.config.is_authenticated = True
-        return {"status": "authenticated", "method": "pin"}
-
     def _auth_headers(self) -> dict[str, str]:
         return {
             "Accept": "application/json",
@@ -108,9 +90,9 @@ class StreamFitService:
         }
 
     def _ensure_auth(self) -> dict[str, Any]:
-        if not self.config.is_authenticated:
-            return self.authenticate()
-        return {"status": "ok"}
+        if self.config.is_authenticated:
+            return {"status": "ok"}
+        return self.authenticate()
 
     # ── Channel / Gym ──────────────────────────────────────────────────────────
 
@@ -151,22 +133,11 @@ class StreamFitService:
         if auth.get("status") == "error":
             return json.dumps({"error": auth["message"]})
 
-        from datetime import datetime, timedelta
-        if start_date:
-            start = datetime.strptime(start_date, "%Y-%m-%d")
-        else:
-            start = datetime.now(timezone.utc)
-
-        # API expects UTC timestamps
-        start_utc = start.replace(hour=4, minute=0, second=0, microsecond=0)  # ~midnight EST
-        end_utc = start_utc + timedelta(days=days)
-
+        start = self._parse_start(start_date)
         params = {
-            "channel_id": self.config.channel_id,
-            "start_at": start_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "end_at": end_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "location_id": "",
-            "timezone": "America/New_York",
+            "start_at": start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "end_at": (start + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "timezone": self.config.timezone,
         }
 
         r = self._client.get(
@@ -189,10 +160,11 @@ class StreamFitService:
                 "class_type": w.get("class_type_name", ""),
                 "duration_minutes": w.get("duration_minutes"),
                 "in_person_max": w.get("in_person_max_users"),
-                "registered_count": w.get("registered_count"),
+                "registered_count": w.get("count_in_person_users", w.get("registered_count")),
                 "canceled": w.get("canceled", False),
+                "coach": (w.get("main_coach") or {}).get("name"),
                 "spots_left": (
-                    w.get("in_person_max_users", 0) - w.get("registered_count", 0)
+                    w.get("in_person_max_users", 0) - w.get("count_in_person_users", 0)
                     if w.get("in_person_max_users") else None
                 ),
             }
@@ -206,6 +178,63 @@ class StreamFitService:
             "to": params["end_at"],
             "count": len(simplified),
             "classes": simplified,
+        }, indent=2, ensure_ascii=False)
+
+    # ── My registrations ──────────────────────────────────────────────────────
+
+    def get_my_registrations(self, start_date: str | None = None, days: int = 14) -> str:
+        """
+        List MY booked classes (registered=true) and waitlist entries.
+
+        Uses /users/calendar/workouts_by_day — the endpoint the web dashboard
+        uses, which carries the per-user `registered` flag.
+        """
+        auth = self._ensure_auth()
+        if auth.get("status") == "error":
+            return json.dumps({"error": auth["message"]})
+
+        start = self._parse_start(start_date) - timedelta(days=1)
+        params = {
+            "start_at": start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "end_at": (start + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "timezone": self.config.timezone,
+        }
+
+        r = self._client.get(
+            f"{self.config.base_url}/api/v1/users/calendar/workouts_by_day",
+            params=params,
+            headers=self._auth_headers(),
+        )
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            return json.dumps({"error": f"HTTP {r.status_code}: {e.response.text[:200]}"})
+
+        data = r.json()
+        booked, waitlisted = [], []
+        for day in data.get("workouts", []):
+            for w in day.get("data", []):
+                wd = w.get("workoutData", {})
+                entry = {
+                    "id": wd.get("id"),
+                    "name": wd.get("name"),
+                    "datetime": wd.get("scheduled_at"),
+                    "coach": (wd.get("main_coach") or {}).get("name"),
+                    "canceled": wd.get("canceled", False),
+                    "spots": f"{wd.get('count_in_person_users')}/{wd.get('in_person_max_users')}",
+                }
+                if wd.get("registered"):
+                    booked.append(entry)
+                elif (wd.get("waitlist_count") or 0) > 0:
+                    entry["waitlist_position"] = wd.get("waitlist_count")
+                    waitlisted.append(entry)
+
+        return json.dumps({
+            "status": "ok",
+            "gym": "CrossFit 514",
+            "booked_count": len(booked),
+            "booked": booked,
+            "waitlisted": waitlisted,
         }, indent=2, ensure_ascii=False)
 
     # ── Workout Details ────────────────────────────────────────────────────────
@@ -234,7 +263,6 @@ class StreamFitService:
 
     def get_coach_notes(self, workout_id: str) -> str:
         """Extract coach notes from a workout's sections."""
-        import json
         raw = self.get_workout(workout_id)
         try:
             root = json.loads(raw)
@@ -254,3 +282,10 @@ class StreamFitService:
         if not notes:
             return "No coach notes found for this workout."
         return "\n\n".join(notes)
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
+
+    def _parse_start(self, start_date: str | None) -> datetime:
+        if start_date:
+            return datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc).replace(hour=4, minute=0, second=0, microsecond=0)

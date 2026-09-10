@@ -63,6 +63,21 @@ def get_class_schedule(start_date: str | None = None, days: int = 7) -> str:
 
 
 @mcp.tool()
+def get_my_registrations(start_date: str | None = None, days: int = 14) -> str:
+    """
+    List MY booked classes at CrossFit 514 (registered=true) plus waitlist entries.
+
+    Args:
+        start_date: ISO date string (YYYY-MM-DD), defaults to today.
+        days: number of days to scan (default 14).
+
+    Returns:
+        JSON with booked classes (name, datetime, coach, spots) and waitlist.
+    """
+    return service.get_my_registrations(start_date=start_date, days=days)
+
+
+@mcp.tool()
 def get_workout(workout_id: str) -> str:
     """
     Fetch full workout details (sections, exercises, coach notes).
