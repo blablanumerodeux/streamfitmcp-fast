@@ -78,6 +78,39 @@ def get_my_registrations(start_date: str | None = None, days: int = 14) -> str:
 
 
 @mcp.tool()
+def register_class(workout_id: str, channel_key_id: int | None = None,
+                   class_type: str = "inPerson", direct_checkin: bool = False) -> str:
+    """
+    Register ME for a class (athlete flow, same as the app's Register button).
+
+    Args:
+        workout_id: StreamFit workout ID (integer or string).
+        channel_key_id: membership key id (auto-detected if omitted).
+        class_type: 'inPerson' (default) or 'online'.
+        direct_checkin: True to check in directly.
+
+    Returns:
+        JSON with status and registration confirmation.
+    """
+    return service.register_class(workout_id=workout_id, channel_key_id=channel_key_id,
+                                  class_type=class_type, direct_checkin=direct_checkin)
+
+
+@mcp.tool()
+def cancel_registration(workout_id: str) -> str:
+    """
+    Cancel MY registration for a class (athlete flow, same as the app's Cancel).
+
+    Args:
+        workout_id: StreamFit workout ID (integer or string).
+
+    Returns:
+        JSON with status and cancellation confirmation.
+    """
+    return service.cancel_registration(workout_id=workout_id)
+
+
+@mcp.tool()
 def get_workout(workout_id: str) -> str:
     """
     Fetch full workout details (sections, exercises, coach notes).

@@ -38,6 +38,28 @@ class StreamFitService:
     def __init__(self, config: StreamFitConfig):
         self.config = config
         self._client = httpx.Client(timeout=30.0)
+        self._user_id: int | None = None
+
+    @property
+    def user_id(self) -> int | None:
+        """Numeric StreamFit user id (needed by register_status). Resolved once
+        from validate_token — ensures tokens are loaded/auth'd first."""
+        if self._user_id is not None:
+            return self._user_id
+        # make sure tokens are loaded BEFORE hitting validate_token
+        self.config.load_tokens_from_file()
+        try:
+            r = self._client.get(
+                f"{self.config.base_url}/api/v1/auth/validate_token",
+                headers=self._auth_headers(),
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json().get("data", {})
+                self._user_id = data.get("id")
+        except Exception:
+            self._user_id = None
+        return self._user_id
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
@@ -236,6 +258,106 @@ class StreamFitService:
             "booked": booked,
             "waitlisted": waitlisted,
         }, indent=2, ensure_ascii=False)
+
+    # ── Register / Cancel (athlete flow, REVERSE-ENGINEERED 2026-09-17) ────────
+    #
+    # The bundle shows the athlete UI uses:
+    #   POST /workouts/{id}/purchase  {workoutId, type, channelKeyId, directCheckin}
+    #      -> 200 {}     (registers; this is the same call the "Register" button makes)
+    #   POST /workouts/{id}/refund    {childId: null}
+    #      -> 200 {}     (cancels / refunds the registration)
+    # The old admin-ish endpoints (/channel_members/.../register, /workouts_users/
+    # .../inactivate_user) are NOT usable from the athlete session.
+
+    def _get_channel_key_id(self, workout_id: str) -> int | None:
+        """Return the first active membership channel key for a workout (for the
+        `channelKeyId` field of the register call)."""
+        try:
+            r = self._client.get(
+                f"{self.config.base_url}/api/v1/workouts_users/{workout_id}/register_status/{self.user_id}",
+                headers=self._auth_headers(),
+            )
+            r.raise_for_status()
+            keys = r.json().get("channel_keys", [])
+            for k in keys:
+                if k.get("active"):
+                    return k.get("id")
+        except Exception:
+            return None
+        return None
+
+    def register_class(self, workout_id: str, channel_key_id: int | None = None,
+                       class_type: str = "inPerson", direct_checkin: bool = False) -> str:
+        """
+        Register ME for a class (athlete flow).
+
+        Args:
+            workout_id: StreamFit workout ID (integer or string)
+            channel_key_id: membership key id (auto-detected if omitted)
+            class_type: "inPerson" or "online"
+            direct_checkin: True to check in directly
+
+        Returns:
+            JSON with status + registration confirmation.
+        """
+        auth = self._ensure_auth()
+        if auth.get("status") == "error":
+            return json.dumps({"error": auth["message"]})
+
+        if channel_key_id is None:
+            channel_key_id = self._get_channel_key_id(workout_id)
+        if channel_key_id is None:
+            return json.dumps({"error": "No active membership channel key found"})
+
+        body = {
+            "workoutId": int(workout_id),
+            "type": class_type,
+            "channelKeyId": channel_key_id,
+            "directCheckin": direct_checkin,
+        }
+        r = self._client.post(
+            f"{self.config.base_url}/api/v1/workouts/{workout_id}/purchase",
+            json=body,
+            headers=self._auth_headers(),
+        )
+        try:
+            r.raise_for_status()
+            return json.dumps({"status": "ok", "registered": True,
+                               "workout_id": int(workout_id),
+                               "channel_key_id": channel_key_id,
+                               "type": class_type}, indent=2)
+        except httpx.HTTPStatusError as e:
+            return json.dumps({"status": "error",
+                               "error": f"HTTP {e.response.status_code}",
+                               "detail": e.response.text[:300]})
+
+    def cancel_registration(self, workout_id: str) -> str:
+        """
+        Cancel MY registration for a class (athlete flow).
+
+        Args:
+            workout_id: StreamFit workout ID (integer or string)
+
+        Returns:
+            JSON with status + cancellation confirmation.
+        """
+        auth = self._ensure_auth()
+        if auth.get("status") == "error":
+            return json.dumps({"error": auth["message"]})
+
+        r = self._client.post(
+            f"{self.config.base_url}/api/v1/workouts/{workout_id}/refund",
+            json={"childId": None},
+            headers=self._auth_headers(),
+        )
+        try:
+            r.raise_for_status()
+            return json.dumps({"status": "ok", "registered": False,
+                               "workout_id": int(workout_id)}, indent=2)
+        except httpx.HTTPStatusError as e:
+            return json.dumps({"status": "error",
+                               "error": f"HTTP {e.response.status_code}",
+                               "detail": e.response.text[:300]})
 
     # ── Workout Details ────────────────────────────────────────────────────────
 
