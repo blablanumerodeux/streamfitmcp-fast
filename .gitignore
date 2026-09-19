@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 *.pyo
 .tokens.json
+*.b64
+*.bak

@@ -1,7 +1,7 @@
 import httpx
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from src.config import StreamFitConfig
@@ -35,10 +35,16 @@ class StreamFitService:
       GET  /api/v1/workouts/{id}                    — workout details
     """
 
-    def __init__(self, config: StreamFitConfig):
+    def __init__(self, config: StreamFitConfig, allow_browser_login: bool = True):
+        """allow_browser_login=False makes auth fail fast instead of driving a
+        headless Chromium login (MFA emails are rate-limited ~5/day) — used by
+        cron scripts, which should surface the error rather than burn a login.
+        """
         self.config = config
+        self.allow_browser_login = allow_browser_login
         self._client = httpx.Client(timeout=30.0)
         self._user_id: int | None = None
+        self._token_validated: bool = False
 
     @property
     def user_id(self) -> int | None:
@@ -46,8 +52,8 @@ class StreamFitService:
         from validate_token — ensures tokens are loaded/auth'd first."""
         if self._user_id is not None:
             return self._user_id
-        # make sure tokens are loaded BEFORE hitting validate_token
-        self.config.load_tokens_from_file()
+        if not self.config.load_tokens_from_file():
+            return None
         try:
             r = self._client.get(
                 f"{self.config.base_url}/api/v1/auth/validate_token",
@@ -57,22 +63,40 @@ class StreamFitService:
             if r.status_code == 200:
                 data = r.json().get("data", {})
                 self._user_id = data.get("id")
-        except Exception:
+                self._token_validated = True
+        except Exception as exc:
+            logger.warning("Could not resolve StreamFit user_id: %s", exc)
             self._user_id = None
         return self._user_id
 
-    # ── Auth ──────────────────────────────────────────────────────────────────
+    # — Auth —————————————————————————————————————————————————
 
     def authenticate(self) -> dict[str, Any]:
         """Validate saved tokens; on failure, re-login via headless browser."""
         # env tokens take priority; otherwise load from tokens file
-        self.config.load_tokens_from_file()
+        if not self.config.load_tokens_from_file():
+            logger.info("No saved tokens; running browser login")
+            return self._browser_login()
 
         if self.config.is_fully_authenticated():
             validated = self._validate_tokens()
             if validated.get("status") == "valid":
                 self.config.is_authenticated = True
+                self._token_validated = True
+                logger.debug("Authenticated via saved tokens")
                 return {"status": "authenticated", "method": "token"}
+            logger.info("Saved tokens invalid (%s); running browser login",
+                        validated.get("code") or validated.get("message"))
+
+        return self._browser_login()
+
+    def _browser_login(self) -> dict[str, Any]:
+        if not self.allow_browser_login:
+            self.config.is_authenticated = False
+            msg = ("Saved StreamFit tokens are invalid and browser login is "
+                   "disabled for this caller: " + (self.config.last_auth_error or "unknown"))
+            logger.error(msg)
+            return {"status": "error", "message": msg}
 
         from src.browser_login import BrowserLogin
         login = BrowserLogin(
@@ -86,6 +110,11 @@ class StreamFitService:
             self.config.access_token = ""
             self.config.load_tokens_from_file()
             self.config.is_authenticated = True
+            self._token_validated = True
+            logger.info("Browser login succeeded")
+        else:
+            self.config.is_authenticated = False
+            logger.error("Browser login failed: %s", result.get("message"))
         return result
 
     def _validate_tokens(self) -> dict[str, Any]:
@@ -112,27 +141,62 @@ class StreamFitService:
         }
 
     def _ensure_auth(self) -> dict[str, Any]:
-        if self.config.is_authenticated:
+        if self.config.is_authenticated and self._token_validated:
             return {"status": "ok"}
         return self.authenticate()
+
+    def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        """Authenticated request against the StreamFit API."""
+        self._ensure_auth()
+        url = f"{self.config.base_url}{path}"
+        headers = {**self._auth_headers(), **kwargs.pop("headers", {})}
+        return self._client.request(method, url, headers=headers, **kwargs)
+
+    def _err(self, e: Exception) -> str:
+        """Uniform JSON error payload (never raises)."""
+        if isinstance(e, httpx.HTTPStatusError):
+            return json.dumps({"status": "error",
+                               "error": f"HTTP {e.response.status_code}",
+                               "detail": e.response.text[:300]}, indent=2)
+        if isinstance(e, httpx.RequestError):
+            return json.dumps({"status": "error",
+                               "error": f"Request failed: {e}"}, indent=2)
+        return json.dumps({"status": "error", "error": str(e)}, indent=2)
+
+    def auth_status(self) -> str:
+        """Health check: are the saved Devise tokens still usable?
+
+        Never triggers a re-login. Lets a caller tell "session broken" apart
+        from "the API refused the operation".
+        """
+        # load tokens first so a missing/unreadable file reports as such
+        self._user_id = None
+        loaded = self.config.load_tokens_from_file()
+        validated = self._validate_tokens() if loaded else {
+            "status": "missing", "message": self.config.last_auth_error}
+        ok = validated.get("status") == "valid"
+        if ok and self.user_id is None:
+            ok = False
+        return json.dumps({
+            "status": "ok" if ok else "error",
+            "auth": validated.get("status"),
+            "detail": validated.get("code") or validated.get("message"),
+            "user_id": self._user_id,
+            "email": self.config.email or None,
+            "channel_id": self.config.channel_id,
+            "tokens_path": self.config.tokens_path,
+        }, indent=2, ensure_ascii=False)
 
     # ── Channel / Gym ──────────────────────────────────────────────────────────
 
     def get_gym_info(self) -> str:
         """Get CrossFit 514 gym information."""
-        auth = self._ensure_auth()
-        if auth.get("status") == "error":
-            return json.dumps({"error": auth["message"]})
-
-        r = self._client.get(
-            f"{self.config.base_url}/api/v1/channels/{self.config.channel_id}",
-            headers=self._auth_headers(),
-        )
         try:
+            r = self._request("GET", f"/api/v1/channels/{self.config.channel_id}")
             r.raise_for_status()
-            return json.dumps(r.json(), indent=2)
-        except httpx.HTTPStatusError:
-            return json.dumps({"error": f"HTTP {r.status_code}"})
+            return json.dumps(r.json(), indent=2, ensure_ascii=False)
+        except Exception as e:
+            return self._err(e)
 
     # ── Schedule ───────────────────────────────────────────────────────────────
 
@@ -151,26 +215,22 @@ class StreamFitService:
         Returns:
             JSON array of class objects with id, name, time, type, capacity info.
         """
-        auth = self._ensure_auth()
-        if auth.get("status") == "error":
-            return json.dumps({"error": auth["message"]})
-
-        start = self._parse_start(start_date)
+        start, end = self._date_range(start_date, days, back_days=0)
         params = {
             "start_at": start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "end_at": (start + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "end_at": end.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
             "timezone": self.config.timezone,
         }
 
-        r = self._client.get(
-            f"{self.config.base_url}/api/v1/channels/{self.config.channel_id}/calendar_workouts",
-            params=params,
-            headers=self._auth_headers(),
-        )
         try:
+            r = self._request(
+                "GET",
+                f"/api/v1/channels/{self.config.channel_id}/calendar_workouts",
+                params=params,
+            )
             r.raise_for_status()
-        except httpx.HTTPStatusError:
-            return json.dumps({"error": f"HTTP {r.status_code}"})
+        except Exception as e:
+            return self._err(e)
 
         data = r.json()
         workouts = data.get("data", [])
@@ -204,6 +264,46 @@ class StreamFitService:
 
     # ── My registrations ──────────────────────────────────────────────────────
 
+    def get_calendar_entries(self, start_date: str | None = None, days: int = 14) -> list[dict[str, Any]]:
+        """MY calendar entries from workouts_by_day (raw but normalized).
+
+        Returns a list of dicts carrying the per-user `registered` flag, the
+        waitlist position, capacity and coach. Callers (get_my_registrations,
+        cron scripts via sf_lib) share this single implementation so the
+        `registered` semantics stay in one place.
+
+        Raises httpx errors on failure — callers that must not raise should use
+        get_my_registrations() which converts them to JSON errors.
+        """
+        start, end = self._date_range(start_date, days, back_days=1)
+        params = {
+            "start_at": start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "end_at": end.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "timezone": self.config.timezone,
+        }
+        r = self._request("GET", "/api/v1/users/calendar/workouts_by_day", params=params)
+        r.raise_for_status()
+
+        entries: list[dict[str, Any]] = []
+        for day in r.json().get("workouts", []):
+            for w in day.get("data", []):
+                wd = w.get("workoutData", {})
+                if not wd.get("id"):
+                    continue
+                entries.append({
+                    "id": wd.get("id"),
+                    "name": wd.get("name"),
+                    "datetime": wd.get("scheduled_at"),
+                    "coach": (wd.get("main_coach") or {}).get("name"),
+                    "canceled": wd.get("canceled", False),
+                    "registered": bool(wd.get("registered")),
+                    "waitlist_position": wd.get("waitlist_count") or 0,
+                    "count_in_person_users": wd.get("count_in_person_users", 0),
+                    "in_person_max_users": wd.get("in_person_max_users", 0),
+                    "spots": f"{wd.get('count_in_person_users')}/{wd.get('in_person_max_users')}",
+                })
+        return entries
+
     def get_my_registrations(self, start_date: str | None = None, days: int = 14) -> str:
         """
         List MY booked classes (registered=true) and waitlist entries.
@@ -211,45 +311,18 @@ class StreamFitService:
         Uses /users/calendar/workouts_by_day — the endpoint the web dashboard
         uses, which carries the per-user `registered` flag.
         """
-        auth = self._ensure_auth()
-        if auth.get("status") == "error":
-            return json.dumps({"error": auth["message"]})
-
-        start = self._parse_start(start_date) - timedelta(days=1)
-        params = {
-            "start_at": start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "end_at": (start + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "timezone": self.config.timezone,
-        }
-
-        r = self._client.get(
-            f"{self.config.base_url}/api/v1/users/calendar/workouts_by_day",
-            params=params,
-            headers=self._auth_headers(),
-        )
         try:
-            r.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            return json.dumps({"error": f"HTTP {r.status_code}: {e.response.text[:200]}"})
+            entries = self.get_calendar_entries(start_date=start_date, days=days)
+        except Exception as e:
+            return self._err(e)
 
-        data = r.json()
-        booked, waitlisted = [], []
-        for day in data.get("workouts", []):
-            for w in day.get("data", []):
-                wd = w.get("workoutData", {})
-                entry = {
-                    "id": wd.get("id"),
-                    "name": wd.get("name"),
-                    "datetime": wd.get("scheduled_at"),
-                    "coach": (wd.get("main_coach") or {}).get("name"),
-                    "canceled": wd.get("canceled", False),
-                    "spots": f"{wd.get('count_in_person_users')}/{wd.get('in_person_max_users')}",
-                }
-                if wd.get("registered"):
-                    booked.append(entry)
-                elif (wd.get("waitlist_count") or 0) > 0:
-                    entry["waitlist_position"] = wd.get("waitlist_count")
-                    waitlisted.append(entry)
+        booked = []
+        for e in entries:
+            if e["registered"]:
+                e.pop("waitlist_position", None)
+                booked.append(e)
+        waitlisted = [e for e in entries
+                      if not e["registered"] and e["waitlist_position"] > 0]
 
         return json.dumps({
             "status": "ok",
@@ -272,18 +345,20 @@ class StreamFitService:
     def _get_channel_key_id(self, workout_id: str) -> int | None:
         """Return the first active membership channel key for a workout (for the
         `channelKeyId` field of the register call)."""
+        if self.user_id is None:
+            return None
         try:
-            r = self._client.get(
-                f"{self.config.base_url}/api/v1/workouts_users/{workout_id}/register_status/{self.user_id}",
-                headers=self._auth_headers(),
+            r = self._request(
+                "GET",
+                f"/api/v1/workouts_users/{workout_id}/register_status/{self.user_id}",
             )
             r.raise_for_status()
             keys = r.json().get("channel_keys", [])
             for k in keys:
                 if k.get("active"):
                     return k.get("id")
-        except Exception:
-            return None
+        except Exception as exc:
+            logger.warning("Could not determine channel key for workout %s: %s", workout_id, exc)
         return None
 
     def register_class(self, workout_id: str, channel_key_id: int | None = None,
@@ -300,14 +375,12 @@ class StreamFitService:
         Returns:
             JSON with status + registration confirmation.
         """
-        auth = self._ensure_auth()
-        if auth.get("status") == "error":
-            return json.dumps({"error": auth["message"]})
-
         if channel_key_id is None:
             channel_key_id = self._get_channel_key_id(workout_id)
         if channel_key_id is None:
-            return json.dumps({"error": "No active membership channel key found"})
+            return json.dumps({"status": "error",
+                               "error": "No active membership channel key found — check auth/membership."},
+                              indent=2)
 
         body = {
             "workoutId": int(workout_id),
@@ -315,21 +388,19 @@ class StreamFitService:
             "channelKeyId": channel_key_id,
             "directCheckin": direct_checkin,
         }
-        r = self._client.post(
-            f"{self.config.base_url}/api/v1/workouts/{workout_id}/purchase",
-            json=body,
-            headers=self._auth_headers(),
-        )
         try:
+            r = self._request(
+                "POST",
+                f"/api/v1/workouts/{workout_id}/purchase",
+                json=body,
+            )
             r.raise_for_status()
             return json.dumps({"status": "ok", "registered": True,
                                "workout_id": int(workout_id),
                                "channel_key_id": channel_key_id,
                                "type": class_type}, indent=2)
-        except httpx.HTTPStatusError as e:
-            return json.dumps({"status": "error",
-                               "error": f"HTTP {e.response.status_code}",
-                               "detail": e.response.text[:300]})
+        except Exception as e:
+            return self._err(e)
 
     def cancel_registration(self, workout_id: str) -> str:
         """
@@ -341,23 +412,17 @@ class StreamFitService:
         Returns:
             JSON with status + cancellation confirmation.
         """
-        auth = self._ensure_auth()
-        if auth.get("status") == "error":
-            return json.dumps({"error": auth["message"]})
-
-        r = self._client.post(
-            f"{self.config.base_url}/api/v1/workouts/{workout_id}/refund",
-            json={"childId": None},
-            headers=self._auth_headers(),
-        )
         try:
+            r = self._request(
+                "POST",
+                f"/api/v1/workouts/{workout_id}/refund",
+                json={"childId": None},
+            )
             r.raise_for_status()
             return json.dumps({"status": "ok", "registered": False,
                                "workout_id": int(workout_id)}, indent=2)
-        except httpx.HTTPStatusError as e:
-            return json.dumps({"status": "error",
-                               "error": f"HTTP {e.response.status_code}",
-                               "detail": e.response.text[:300]})
+        except Exception as e:
+            return self._err(e)
 
     # ── Workout Details ────────────────────────────────────────────────────────
 
@@ -368,18 +433,11 @@ class StreamFitService:
         Args:
             workout_id: StreamFit workout ID (integer or string)
         """
-        auth = self._ensure_auth()
-        if auth.get("status") == "error":
-            return json.dumps({"error": auth["message"]})
-
-        r = self._client.get(
-            f"{self.config.base_url}/api/v1/workouts/{workout_id}",
-            headers=self._auth_headers(),
-        )
         try:
+            r = self._request("GET", f"/api/v1/workouts/{workout_id}")
             r.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            return json.dumps({"error": f"HTTP {e.response.status_code}: {e.response.text[:200]}"})
+        except Exception as e:
+            return self._err(e)
 
         return r.text
 
@@ -411,3 +469,14 @@ class StreamFitService:
         if start_date:
             return datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         return datetime.now(timezone.utc).replace(hour=4, minute=0, second=0, microsecond=0)
+
+    def _date_range(self, start_date: str | None, days: int,
+                    back_days: int = 0) -> tuple[datetime, datetime]:
+        """Compute the [start, end) window sent to the API.
+
+        With no explicit start_date the window anchors at 04:00 UTC (≈ midnight
+        EDT) so the current class day is always fully covered.
+        """
+        start = self._parse_start(start_date) - timedelta(days=back_days)
+        end = start + timedelta(days=max(days, 1))
+        return start, end
